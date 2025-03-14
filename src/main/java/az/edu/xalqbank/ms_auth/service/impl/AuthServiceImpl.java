@@ -16,12 +16,14 @@ import az.edu.xalqbank.ms_auth.security.JwtTokenProvider;
 import az.edu.xalqbank.ms_auth.service.AuthService;
 import az.edu.xalqbank.ms_auth.service.EmailService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+
+import java.time.Duration;
 import java.util.UUID;
 
 @Service
@@ -33,6 +35,17 @@ public class AuthServiceImpl implements AuthService {
     private final UserRepository userRepository;
     private final EmailService emailService;
     private final PasswordEncoder passwordEncoder;
+    private final RedisTemplate<String, Object> redisTemplate;
+
+    private void storeToken(String key, String token) {
+        Duration ttl = key.startsWith("access_token") ? Duration.ofMinutes(30) : Duration.ofDays(7);
+        redisTemplate.opsForValue().set(key, token, ttl);
+    }
+
+
+    public String getToken(String tokenKey) {
+        return (String) redisTemplate.opsForValue().get(tokenKey);
+    }
 
     @Override
     public LoginResponse login(LoginRequest request) {
@@ -44,6 +57,9 @@ public class AuthServiceImpl implements AuthService {
 
         String accessToken = jwtTokenProvider.generateAccessToken(authentication);
         String refreshToken = jwtTokenProvider.generateRefreshToken(authentication);
+
+        storeToken("access_token:" + user.getId(), accessToken);
+        storeToken("refresh_token:" + user.getId(), refreshToken);
 
         return LoginResponse.builder()
                 .accessToken(accessToken)
@@ -65,13 +81,21 @@ public class AuthServiceImpl implements AuthService {
 
         String username = jwtTokenProvider.getUsernameFromToken(refreshToken);
 
-        UserDetails userDetails = userRepository.findByEmail(username)
+        UserEntity user = userRepository.findByEmail(username)
                 .orElseThrow(() -> new UserNotFoundException("User not found"));
 
+        String storedRefreshToken = getToken("refresh_token:" + user.getId());
+        if (storedRefreshToken == null || !storedRefreshToken.equals(refreshToken)) {
+            redisTemplate.delete("refresh_token:" + user.getId());
+            throw new InvalidTokenException("Refresh token not found or expired");
+        }
+
         UsernamePasswordAuthenticationToken auth =
-                new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities());
+                new UsernamePasswordAuthenticationToken(user, null, user.getAuthorities());
 
         String newAccessToken = jwtTokenProvider.generateAccessToken(auth);
+
+        storeToken("access_token:" + user.getId(), newAccessToken);
 
         return RefreshTokenResponse.builder()
                 .accessToken(newAccessToken)
@@ -88,10 +112,9 @@ public class AuthServiceImpl implements AuthService {
             throw new CustomAccessDeniedException("You can only reset your own password");
         }
 
-        UserEntity user = userRepository.findByEmail(request.getEmail())
+        userRepository.findByEmail(request.getEmail())
                 .orElseThrow(() -> new UserNotFoundException("User not found"));
 
-        // Token yarat
         String resetToken = UUID.randomUUID().toString();
 
         String subject = "Password Reset Request";
